@@ -1,0 +1,236 @@
+--[[
+Credits to LLH Lua Land :3
+Deobfuscator for mode Chaotic Good LuaObfuscator Alpha
+--]]
+
+import re
+import json
+
+def _decode_lua_escaped_text(value):
+    output = []
+    index = 0
+    escape_map = {
+        "a": "\a", "b": "\b", "f": "\f", "n": "\n",
+        "r": "\r", "t": "\t", "v": "\v", "\\": "\\",
+        '"': '"', "'": "'",
+    }
+    while index < len(value):
+        c = value[index]
+        if c != "\\":
+            output.append(c)
+            index += 1
+            continue
+        index += 1
+        if index >= len(value):
+            output.append("\\")
+            break
+        e = value[index]
+        if e.isdigit():
+            digits = [e]
+            index += 1
+            while index < len(value) and len(digits) < 3 and value[index].isdigit():
+                digits.append(value[index])
+                index += 1
+            output.append(chr(int("".join(digits), 10) % 256))
+            continue
+        if e == "x" and index + 2 < len(value):
+            hex_ = value[index + 1:index + 3]
+            if re.fullmatch(r"[0-9a-fA-F]{2}", hex_):
+                output.append(chr(int(hex_, 16)))
+                index += 3
+                continue
+        output.append(escape_map.get(e, e))
+        index += 1
+    return "".join(output)
+
+def _lua_literal(value):
+    return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
+
+def remove_lua_comments(code):
+    out = []
+    i, n = 0, len(code)
+    quote = None
+    long_str = re.compile(r"\[(=*)\[")
+    long_comm = re.compile(r"--\[(=*)\[")
+    while i < n:
+        ch = code[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                i += 1
+                out.append(code[i])
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "[":
+            m = long_str.match(code, i)
+            if m:
+                opener = m.group(0)
+                closer = "]" + m.group(1) + "]"
+                end = code.find(closer, i + len(opener))
+                if end == -1:
+                    out.append(code[i:])
+                    break
+                out.append(code[i:end + len(closer)])
+                i = end + len(closer)
+                continue
+        if ch == "-" and i + 1 < n and code[i + 1] == "-":
+            m = long_comm.match(code, i)
+            if m:
+                opener = m.group(0)
+                closer = "]" + m.group(1) + "]"
+                end = code.find(closer, i + len(opener))
+                i = n if end == -1 else end + len(closer)
+            else:
+                nl = code.find("\n", i + 2)
+                i = n if nl == -1 else nl
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+def rename_obfuscated_lua_identifiers(code):
+    renamed = {}
+    id_pat = re.compile(
+        r"\b(?:v|var|value|f|fn|func|function|t|tbl|table|s|str|string|n|num|number|l|local|a|b|c|d|x|y|z)\d+\b"
+    )
+    tok_pat = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    long_str = re.compile(r"\[(=*)\[")
+    def repl(m):
+        ident = m.group(0)
+        pm = re.match(r"[A-Za-z]+", ident)
+        nm = re.search(r"\d+", ident)
+        if not pm or not nm:
+            return ident
+        prefix = pm.group(0).lower()
+        num = nm.group(0)
+        names = {
+            "v":"value","var":"value","value":"value",
+            "f":"function","fn":"function","func":"function","function":"function",
+            "t":"table","tbl":"table","table":"table",
+            "s":"string","str":"string","string":"string",
+            "n":"number","num":"number","number":"number",
+            "l":"local","local":"local",
+            "a":"argument","b":"buffer","c":"context","d":"data",
+            "x":"coordinate_x","y":"coordinate_y","z":"coordinate_z"
+        }
+        new_name = f"{names.get(prefix, 'variable')}_{num}"
+        renamed.setdefault(ident, new_name)
+        return renamed[ident]
+    out = []
+    i, n = 0, len(code)
+    prev_sig = ""
+    while i < n:
+        ch = code[i]
+        if ch in ("'", '"'):
+            q = ch
+            start = i
+            i += 1
+            while i < n:
+                if code[i] == "\\":
+                    i += 2
+                    continue
+                if code[i] == q:
+                    i += 1
+                    break
+                i += 1
+            out.append(code[start:i])
+            prev_sig = q
+            continue
+        if ch == "[":
+            m = long_str.match(code, i)
+            if m:
+                opener = m.group(0)
+                closer = "]" + m.group(1) + "]"
+                end = code.find(closer, i + len(opener))
+                if end == -1:
+                    out.append(code[i:])
+                    break
+                end += len(closer)
+                out.append(code[i:end])
+                i = end
+                prev_sig = "]"
+                continue
+        m = tok_pat.match(code, i)
+        if m:
+            ident = m.group(0)
+            if prev_sig in (".", ":"):
+                out.append(ident)
+            else:
+                out.append(id_pat.sub(repl, ident))
+            prev_sig = ident[-1]
+            i += len(ident)
+            continue
+        out.append(ch)
+        if not ch.isspace():
+            prev_sig = ch
+        i += 1
+    return "".join(out)
+
+def clean_lua(code):
+    cleaned = remove_lua_comments(code).strip()
+    cleaned = rename_obfuscated_lua_identifiers(cleaned).strip()
+    return cleaned
+
+def _extract_loadstring_string(code):
+    pat = re.compile(r'\b(?:loadstring|load)\s*\(\s*(["\'])((?:\\.|[^\\\'"])*?)\1\s*[,)]', re.DOTALL)
+    m = pat.search(code)
+    if m:
+        return _decode_lua_escaped_text(m.group(2))
+    long_pat = re.compile(r'\b(?:loadstring|load)\s*\(\s*\[(=*)\[([\s\S]*?)\]\1\]\s*[,)]')
+    lm = long_pat.search(code)
+    if lm:
+        return lm.group(2)
+    return None
+
+def _luaobfuscator_candidate_matches_chaotic_good(content):
+    return bool(re.search(r'v7\s*\(\s*"\\\d+', content) and "LOL!" not in content)
+
+def _deobfuscate_chaotic_good(content):
+    pat = re.compile(r'v7\s*\(\s*"((?:\\.|[^"])*)"\s*,\s*"((?:\\.|[^"])*)"\s*\)')
+    matches = list(pat.finditer(content))
+    if not matches:
+        return None
+    reps = {}
+    for m in matches:
+        enc = _decode_lua_escaped_text(m.group(1)).encode("latin1", errors="ignore")
+        key = _decode_lua_escaped_text(m.group(2)).encode("latin1", errors="ignore")
+        if not enc or not key:
+            continue
+        dec = bytes(
+            b ^ key[i % len(key)] for i, b in enumerate(enc, 1)
+        ).decode("utf-8", errors="replace")
+        reps[m.group(0)] = _lua_literal(dec)
+    if not reps:
+        return None
+    out = content
+    for src, dst in reps.items():
+        out = out.replace(src, dst)
+    out = remove_lua_comments(out).strip()
+    out = re.sub(r'\blocal\s+v\d+\s*=\s*string\.(?:char|byte|sub)\s*;?', "", out)
+    out = re.sub(r'\blocal\s+v\d+\s*=\s*bit32\s+or\s+bit\s*;?', "", out)
+    out = re.sub(r'\blocal\s+v\d+\s*=\s*v\d+\.bxor\s*;?', "", out)
+    out = re.sub(r'\blocal\s+v\d+\s*=\s*table\.(?:concat|insert)\s*;?', "", out)
+    out = re.sub(r'\blocal\s+function\s+v7\s*\([^)]*\).*?end\s*', "", out, flags=re.DOTALL)
+    out = re.sub(r'\n{3,}', "\n\n", out).strip()
+    print_calls = re.findall(r'\bprint\s*\([^;\n]*\)', out)
+    if print_calls:
+        return "\n".join(print_calls)
+    return out if out else None
+
+def deobfuscate_chaotic_good(code):
+    if not _luaobfuscator_candidate_matches_chaotic_good(code):
+        return None
+    decoded = _deobfuscate_chaotic_good(code)
+    if not decoded:
+        return None
+    payload = _extract_loadstring_string(decoded)
+    if payload:
+        return clean_lua(payload)
+    return clean_lua(decoded)
